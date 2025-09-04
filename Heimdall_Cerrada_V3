@@ -1,0 +1,553 @@
+#include <Wire.h>
+#include <ESP32Servo.h>
+#include <SPI.h>
+#include <Pixy2SPI_SS.h>
+#include <NewPing.h>
+#include <MPU6050_light.h>
+
+// Pines y canales
+#define IN1 16
+#define IN2 17
+#define MOTOR_PWM_CHANNEL 6
+#define MOTOR_PWM_PIN IN1
+#define PIN_SERVO 2
+#define PIN_BOTON 15
+
+#define USTLEFT 14
+#define USELEFT 27
+#define USTRIGHT 26
+#define USERIGHT 25
+#define USTFRONT 13
+#define USEFRONT 12
+
+#define MAX_DISTANCE 357
+#define PWM_FREQUENCY 5000
+#define PWM_RESOLUTION 8
+
+// Parámetros PID Giroscopio
+const int CORRECCION_MAX = 15; 
+const float kP = 1.3;
+const float kI = 0.01;
+const float kD = 0.10;
+const int DEAD_BAND_CORRECCION = 3;
+
+// Objetos sensores
+NewPing sensorFront(USTFRONT, USEFRONT, MAX_DISTANCE);
+NewPing sensorIzq(USTLEFT, USELEFT, MAX_DISTANCE);
+NewPing sensorDer(USTRIGHT, USERIGHT, MAX_DISTANCE);
+MPU6050 mpu(Wire);
+Pixy2SPI_SS pixy;
+Servo myservo;
+
+// Velocidades
+int velocidadNormal = 150;
+int velocidadReversa = 100;
+int velocidadGiro = 150;
+
+// Parámetros de control
+const int ANGULO_CENTRO = 98;
+const int ANGULO_MAX = 128;
+const int ANGULO_MIN = 68;
+
+// Parámetros de esquiva (ajustables)
+const int ANGULO_ESQUIVA_PRIMARIO = 25;
+const int ANGULO_ESQUIVA_SECUNDARIO = 20;
+const unsigned long TIEMPO_ESQUIVA_PRIMARIA = 655;
+const unsigned long TIEMPO_RECTA_ENTRE_GIROS = 100;
+const unsigned long TIEMPO_ESQUIVA_SECUNDARIA = 590;
+
+// Tiempos de maniobras
+const unsigned long TIEMPO_ESQUIVA_VERDE = TIEMPO_ESQUIVA_PRIMARIA + TIEMPO_RECTA_ENTRE_GIROS + TIEMPO_ESQUIVA_SECUNDARIA;
+const unsigned long TIEMPO_ESQUIVA_ROJO = TIEMPO_ESQUIVA_PRIMARIA + TIEMPO_RECTA_ENTRE_GIROS + TIEMPO_ESQUIVA_SECUNDARIA;
+const unsigned long TIEMPO_POST_ESQUIVA_VERDE = 100;
+const unsigned long TIEMPO_POST_ESQUIVA_ROJO = 150;
+const unsigned long TIEMPO_GIRO_DERECHA_VERDE = 860;
+const unsigned long TIEMPO_GIRO_IZQUIERDA_VERDE = 610;
+const unsigned long TIEMPO_GIRO_IZQUIERDA_ROJO = 670;
+const unsigned long TIEMPO_GIRO_DERECHA_ROJO = 500;
+const unsigned long TIEMPO_RETROCESO = 1060;
+const unsigned long TIEMPO_RETROCESO_FINAL = 1200;
+
+// Umbrales de detección de Pixy
+const int UMBRAL_TAMANO_BLOQUE_VERDE = 1620;
+const int UMBRAL_TAMANO_BLOQUE_ROJO = 17;
+const int OBSTACULO_FRONTAL = 25;
+
+// Estados del robot
+enum Estado {
+  DETENIDO,
+  AVANZAR,
+  ESQUIVAR_VERDE_IZQ,
+  ESQUIVAR_ROJO_DER,
+  POST_ESQUIVA_VERDE,
+  POST_ESQUIVA_ROJO,
+  GIRO_SERVO,
+  RETROCEDER_CON_GIRO,
+  RETROCEDER_FINAL,
+  REAJUSTAR_POSICION,
+  CALIBRAR_GIROSCOPIO
+};
+
+Estado estadoActual = DETENIDO;
+bool bloqueVerdeDetectado = false;
+bool bloqueRojoDetectado = false;
+bool bloqueVerdeCercano = false;
+bool bloqueRojoCercano = false;
+int posicionBloqueX = 0;
+int ladoMasLibre = 0;
+
+// Variable para recordar el último giro (0: sin giro previo, -1: izquierda, 1: derecha)
+int ultimoGiro = 0;
+
+// Variables giroscopio
+float offsetAngleZ = 0;
+bool calibrado = false;
+bool usarCorreccionGiroscopio = false;
+unsigned long tiempoCalibracionInicio = 0;
+const unsigned long DURACION_CALIBRACION = 5000;
+
+// Variables PID
+float integralError = 0;
+float prevError = 0;
+unsigned long prevTime = 0;
+
+// Variables para el control de movimiento por tiempo
+unsigned long tiempoInicioManiobra = 0;
+unsigned long tiempoFaseActual = 0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Configurar pines de motor
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  ledcSetup(MOTOR_PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(MOTOR_PWM_PIN, MOTOR_PWM_CHANNEL);
+  
+  // Configurar servo
+  myservo.attach(PIN_SERVO);
+  myservo.write(ANGULO_CENTRO);
+  
+  // Configurar botón
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+  
+  // Inicializar Pixy
+  pixy.init();
+  pixy.setLamp(1, 1);
+  
+  // Inicializar MPU6050
+  Wire.begin();
+  byte status = mpu.begin();
+  if (status != 0) {
+    Serial.print("Error iniciando MPU6050. Status: ");
+    Serial.println(status);
+  } else {
+    Serial.println("MPU6050 iniciado correctamente.");
+    mpu.calcOffsets();
+  }
+  
+  prevTime = millis();
+  Serial.println("Robot inicializado. Presione el botón para comenzar.");
+}
+
+void loop() {
+  // Leer estado del botón
+  if (digitalRead(PIN_BOTON) == LOW && estadoActual == DETENIDO) {
+    estadoActual = CALIBRAR_GIROSCOPIO;
+    tiempoCalibracionInicio = millis();
+    Serial.println("Iniciando calibración giroscopio...");
+  }
+  
+  // Actualizar MPU
+  mpu.update();
+  
+  // Leer sensores ultrasónicos
+  int distanciaFrontal = sensorFront.ping_cm();
+  int distanciaIzquierda = sensorIzq.ping_cm();
+  int distanciaDerecha = sensorDer.ping_cm();
+  
+  // Leer datos de Pixy (pero no detener la maniobra si ya comenzó)
+  if (estadoActual != ESQUIVAR_VERDE_IZQ && estadoActual != ESQUIVAR_ROJO_DER && 
+      estadoActual != POST_ESQUIVA_VERDE && estadoActual != POST_ESQUIVA_ROJO &&
+      estadoActual != CALIBRAR_GIROSCOPIO) {
+    leerPixy();
+  }
+  
+  // Mostrar información de depuración
+  if (millis() % 1000 < 50) {
+    Serial.print("Estado: ");
+    Serial.print(estadoActual);
+    Serial.print(" | Frontal: ");
+    Serial.print(distanciaFrontal);
+    Serial.print("cm | Izq: ");
+    Serial.print(distanciaIzquierda);
+    Serial.print("cm | Der: ");
+    Serial.print(distanciaDerecha);
+    Serial.print("cm | Verde: ");
+    Serial.print(bloqueVerdeDetectado);
+    Serial.print(" | Rojo: ");
+    Serial.print(bloqueRojoDetectado);
+    Serial.print(" | Giroscopio: ");
+    Serial.print(calibrado ? "Calibrado" : "NoCalibrado");
+    Serial.print(" | Correccion: ");
+    Serial.print(usarCorreccionGiroscopio ? "ON" : "OFF");
+    Serial.print(" | ÚltimoGiro: ");
+    Serial.println(ultimoGiro);
+  }
+  
+  // Máquina de estados del robot
+  switch (estadoActual) {
+    case DETENIDO:
+      detenerRobot();
+      break;
+      
+    case CALIBRAR_GIROSCOPIO:
+      // Calibración del giroscopio - ROBOT DETENIDO
+      tiempoFaseActual = millis() - tiempoCalibracionInicio;
+      detenerRobot(); // Asegurar que el robot está detenido
+      
+      if (tiempoFaseActual < DURACION_CALIBRACION) {
+        Serial.print("Calibrando... ");
+        Serial.print(tiempoFaseActual / 1000.0);
+        Serial.println(" seg");
+        delay(100);
+      } else {
+        offsetAngleZ = mpu.getAngleZ();
+        calibrado = true;
+        integralError = 0;
+        prevError = 0;
+        prevTime = millis();
+        estadoActual = AVANZAR;
+        usarCorreccionGiroscopio = true;
+        Serial.println("Calibración giroscopio completada, iniciando movimiento.");
+      }
+      break;
+      
+    case AVANZAR:
+      // Aplicar corrección de giroscopio solo si está calibrado y activado
+      if (calibrado && usarCorreccionGiroscopio) {
+        aplicarCorreccionGiroscopio();
+      } else {
+        // Sin corrección, avanzar recto
+        myservo.write(ANGULO_CENTRO);
+        avanzar();
+      }
+      
+      // Verificar obstáculos y tomar decisiones
+      if (distanciaFrontal > 0 && distanciaFrontal < OBSTACULO_FRONTAL) {
+        if (!bloqueVerdeDetectado && !bloqueRojoDetectado) {
+          // Usar el último giro como prioridad si existe
+          if (ultimoGiro != 0) {
+            ladoMasLibre = ultimoGiro;
+            Serial.print("Usando último giro recordado: ");
+            Serial.println(ultimoGiro == 1 ? "Derecha" : "Izquierda");
+          } 
+          // Si no hay último giro, decidir basado en distancias
+          else if (distanciaIzquierda > distanciaDerecha + 5) {
+            ladoMasLibre = 1;
+          } else if (distanciaDerecha > distanciaIzquierda + 5) {
+            ladoMasLibre = -1;
+          } 
+          // Si no hay diferencia clara, girar a la izquierda por defecto
+          else {
+            ladoMasLibre = -1;
+          }
+          
+          // Guardar el giro actual como último giro
+          ultimoGiro = ladoMasLibre;
+          
+          // Desactivar corrección durante giro
+          usarCorreccionGiroscopio = false;
+          estadoActual = GIRO_SERVO;
+          tiempoInicioManiobra = millis();
+          Serial.println("Obstáculo frontal detectado, girando servo");
+        }
+      }
+      
+      // Comportamiento según color detectado
+      if (bloqueVerdeDetectado && bloqueVerdeCercano) {
+        if (posicionBloqueX == 1) {
+          Serial.println("Verde detectado a la derecha, sigo recto");
+        } else if (posicionBloqueX == -1) {
+          // Desactivar corrección durante esquiva
+          usarCorreccionGiroscopio = false;
+          estadoActual = ESQUIVAR_VERDE_IZQ;
+          tiempoInicioManiobra = millis();
+          Serial.println("Verde detectado a la izquierda, iniciando esquiva");
+        }
+      } else if (bloqueRojoDetectado && bloqueRojoCercano) {
+        if (posicionBloqueX == -1) {
+          Serial.println("Rojo detectado a la izquierda, sigo recto");
+        } else if (posicionBloqueX == 1) {
+          // Desactivar corrección durante esquiva
+          usarCorreccionGiroscopio = false;
+          estadoActual = ESQUIVAR_ROJO_DER;
+          tiempoInicioManiobra = millis();
+          Serial.println("Rojo detectado a la derecha, iniciando esquiva");
+        }
+      }
+      break;
+      
+    case ESQUIVAR_VERDE_IZQ:
+      // Esquiva para bloque verde a la izquierda (SIN corrección de giroscopio)
+      tiempoFaseActual = millis() - tiempoInicioManiobra;
+      
+      if (tiempoFaseActual < TIEMPO_ESQUIVA_PRIMARIA) {
+        myservo.write(ANGULO_CENTRO + ANGULO_ESQUIVA_PRIMARIO);
+        avanzar();
+        Serial.println("Fase 1: Esquivando a la derecha");
+      } else if (tiempoFaseActual < TIEMPO_ESQUIVA_PRIMARIA + TIEMPO_RECTA_ENTRE_GIROS) {
+        myservo.write(ANGULO_CENTRO);
+        avanzar();
+        Serial.println("Fase 2: Avanzando recto");
+      } else if (tiempoFaseActual < TIEMPO_ESQUIVA_VERDE) {
+        myservo.write(ANGULO_CENTRO - ANGULO_ESQUIVA_SECUNDARIO);
+        avanzar();
+        Serial.println("Fase 3: Re-centrando a la izquierda");
+      } else {
+        estadoActual = POST_ESQUIVA_VERDE;
+        tiempoInicioManiobra = millis();
+        Serial.println("Esquiva verde completada, iniciando secuencia post-esquiva");
+      }
+      break;
+      
+    case POST_ESQUIVA_VERDE:
+      // Secuencia post-esquiva verde (SIN corrección de giroscopio)
+      tiempoFaseActual = millis() - tiempoInicioManiobra;
+      
+      if (tiempoFaseActual < TIEMPO_POST_ESQUIVA_VERDE) {
+        myservo.write(ANGULO_CENTRO);
+        avanzar();
+        Serial.println("Post-esquiva verde: Avanzando recto");
+      } else if (tiempoFaseActual < TIEMPO_POST_ESQUIVA_VERDE + TIEMPO_GIRO_DERECHA_VERDE) {
+        myservo.write(ANGULO_CENTRO - ANGULO_ESQUIVA_PRIMARIO);
+        avanzar();
+        Serial.println("Post-esquiva verde: Girando a la derecha");
+      } else if (tiempoFaseActual < TIEMPO_POST_ESQUIVA_VERDE + TIEMPO_GIRO_DERECHA_VERDE + TIEMPO_RECTA_ENTRE_GIROS) {
+        myservo.write(ANGULO_CENTRO);
+        avanzar();
+        Serial.println("Post-esquiva verde: Centrando servo");
+      } else if (tiempoFaseActual < TIEMPO_POST_ESQUIVA_VERDE + TIEMPO_GIRO_DERECHA_VERDE + TIEMPO_RECTA_ENTRE_GIROS + TIEMPO_GIRO_IZQUIERDA_VERDE) {
+        myservo.write(ANGULO_CENTRO + ANGULO_ESQUIVA_PRIMARIO);
+        avanzar();
+        Serial.println("Post-esquiva verde: Girando a la izquierda");
+      } else {
+        // Volver a avanzar normalmente SIN recalibrar
+        myservo.write(ANGULO_CENTRO);
+        estadoActual = AVANZAR;
+        usarCorreccionGiroscopio = true; // Reactivar corrección
+        Serial.println("Secuencia post-esquiva completada, avanzando normalmente");
+      }
+      break;
+      
+    case ESQUIVAR_ROJO_DER:
+      // Esquiva para bloque rojo a la derecha (SIN corrección de giroscopio)
+      tiempoFaseActual = millis() - tiempoInicioManiobra;
+      
+      if (tiempoFaseActual < TIEMPO_ESQUIVA_PRIMARIA) {
+        myservo.write(ANGULO_CENTRO - ANGULO_ESQUIVA_PRIMARIO);
+        avanzar();
+        Serial.println("Fase 1: Esquivando a la izquierda");
+      } else if (tiempoFaseActual < TIEMPO_ESQUIVA_PRIMARIA + TIEMPO_RECTA_ENTRE_GIROS) {
+        myservo.write(ANGULO_CENTRO);
+        avanzar();
+        Serial.println("Fase 2: Avanzando recto");
+      } else if (tiempoFaseActual < TIEMPO_ESQUIVA_ROJO) {
+        myservo.write(ANGULO_CENTRO + ANGULO_ESQUIVA_SECUNDARIO);
+        avanzar();
+        Serial.println("Fase 3: Re-centrando a la derecha");
+      } else {
+        estadoActual = POST_ESQUIVA_ROJO;
+        tiempoInicioManiobra = millis();
+        Serial.println("Esquiva rojo completada, iniciando secuencia post-esquiva");
+      }
+      break;
+      
+    case POST_ESQUIVA_ROJO:
+      // Secuencia post-esquiva rojo (SIN corrección de giroscopio)
+      tiempoFaseActual = millis() - tiempoInicioManiobra;
+      
+      if (tiempoFaseActual < TIEMPO_POST_ESQUIVA_ROJO) {
+        myservo.write(ANGULO_CENTRO);
+        avanzar();
+        Serial.println("Post-esquiva rojo: Avanzando recto");
+      } else if (tiempoFaseActual < TIEMPO_POST_ESQUIVA_ROJO + TIEMPO_GIRO_IZQUIERDA_ROJO) {
+        myservo.write(ANGULO_CENTRO + ANGULO_ESQUIVA_PRIMARIO);
+        avanzar();
+        Serial.println("Post-esquiva rojo: Girando a la izquierda");
+      } else if (tiempoFaseActual < TIEMPO_POST_ESQUIVA_ROJO + TIEMPO_GIRO_IZQUIERDA_ROJO + TIEMPO_RECTA_ENTRE_GIROS) {
+        myservo.write(ANGULO_CENTRO);
+        avanzar();
+        Serial.println("Post-esquiva rojo: Centrando servo");
+      } else if (tiempoFaseActual < TIEMPO_POST_ESQUIVA_ROJO + TIEMPO_GIRO_IZQUIERDA_ROJO + TIEMPO_RECTA_ENTRE_GIROS + TIEMPO_GIRO_DERECHA_ROJO) {
+        myservo.write(ANGULO_CENTRO - ANGULO_ESQUIVA_PRIMARIO);
+        avanzar();
+        Serial.println("Post-esquiva rojo: Girando a la derecha");
+      } else {
+        // Volver a avanzar normalmente SIN recalibrar
+        myservo.write(ANGULO_CENTRO);
+        estadoActual = AVANZAR;
+        usarCorreccionGiroscopio = true; // Reactivar corrección
+        Serial.println("Secuencia post-esquiva completada, avanzando normalmente");
+      }
+      break;
+      
+    case GIRO_SERVO:
+      if (ladoMasLibre == -1) {
+        myservo.write(ANGULO_MAX);
+        Serial.println("Servo girado a derecha (contrario a izquierda libre)");
+      } else {
+        myservo.write(ANGULO_MIN);
+        Serial.println("Servo girado a izquierda (contrario a derecha libre)");
+      }
+      
+      estadoActual = RETROCEDER_CON_GIRO;
+      tiempoInicioManiobra = millis();
+      break;
+      
+    case RETROCEDER_CON_GIRO:
+      tiempoFaseActual = millis() - tiempoInicioManiobra;
+      
+      if (tiempoFaseActual < TIEMPO_RETROCESO) {
+        retroceder();
+        Serial.println("Retrocediendo con servo girado");
+      } else {
+        myservo.write(ANGULO_CENTRO);
+        estadoActual = RETROCEDER_FINAL;
+        tiempoInicioManiobra = millis();
+        Serial.println("Centrando servo y retrocediendo más");
+      }
+      break;
+      
+    case RETROCEDER_FINAL:
+      tiempoFaseActual = millis() - tiempoInicioManiobra;
+      
+      if (tiempoFaseActual < TIEMPO_RETROCESO_FINAL) {
+        retroceder();
+        Serial.println("Retrocediendo final hacia la pared");
+      } else {
+        // Después de retroceder, DETENER y RECALIBRAR giroscopio
+        detenerRobot();
+        estadoActual = CALIBRAR_GIROSCOPIO;
+        tiempoCalibracionInicio = millis();
+        calibrado = false;
+        usarCorreccionGiroscopio = false;
+        Serial.println("Retroceso finalizado, recalibrando giroscopio");
+      }
+      break;
+      
+    case REAJUSTAR_POSICION:
+      estadoActual = AVANZAR;
+      break;
+  }
+  
+  delay(50);
+}
+
+void aplicarCorreccionGiroscopio() {
+  float anguloRaw = mpu.getAngleZ();
+  float anguloZ = anguloRaw - offsetAngleZ;
+  float error = -anguloZ;
+  
+  if (abs(error) > DEAD_BAND_CORRECCION) {
+    unsigned long currentTime = millis();
+    float deltaTime = (currentTime - prevTime) / 1000.0;
+    if (deltaTime <= 0) deltaTime = 0.01;
+    
+    integralError += error * deltaTime;
+    integralError = constrain(integralError, -50, 50);
+    float derivative = (error - prevError) / deltaTime;
+    float output = kP * error + kI * integralError + kD * derivative;
+    
+    prevError = error;
+    prevTime = currentTime;
+    
+    int correccionMin = ANGULO_CENTRO - CORRECCION_MAX;
+    int correccionMax = ANGULO_CENTRO + CORRECCION_MAX;
+    int correccion = ANGULO_CENTRO + (int)output;
+    correccion = constrain(correccion, correccionMin, correccionMax);
+    correccion = constrain(correccion, ANGULO_MIN, ANGULO_MAX);
+
+    Serial.print("PID Corrección servo: ");
+    Serial.print(correccion);
+    Serial.print(" | err: ");
+    Serial.print(error);
+    Serial.print(" | I: ");
+    Serial.print(integralError);
+    Serial.print(" | D: ");
+    Serial.println(derivative);
+
+    myservo.write(correccion);
+    avanzar();
+  } else {
+    myservo.write(ANGULO_CENTRO);
+    integralError = 0;
+    prevError = 0;
+    prevTime = millis();
+    myservo.write(ANGULO_CENTRO);
+    avanzar();
+  }
+}
+
+void leerPixy() {
+  static unsigned long ultimaLectura = 0;
+  
+  if (millis() - ultimaLectura > 100) {
+    ultimaLectura = millis();
+    
+    pixy.ccc.getBlocks();
+    
+    bloqueVerdeDetectado = false;
+    bloqueRojoDetectado = false;
+    bloqueVerdeCercano = false;
+    bloqueRojoCercano = false;
+    posicionBloqueX = 0;
+    
+    if (pixy.ccc.numBlocks) {
+      for (int i = 0; i < pixy.ccc.numBlocks; i++) {
+        if (pixy.ccc.blocks[i].m_signature == 1) {
+          bloqueVerdeDetectado = true;
+          if (pixy.ccc.blocks[i].m_x < pixy.frameWidth / 2) {
+            posicionBloqueX = -1;
+          } else {
+            posicionBloqueX = 1;
+          }
+          if (pixy.ccc.blocks[i].m_width * pixy.ccc.blocks[i].m_height > UMBRAL_TAMANO_BLOQUE_VERDE) {
+            bloqueVerdeCercano = true;
+          }
+          break;
+        }
+        else if (pixy.ccc.blocks[i].m_signature == 2) {
+          bloqueRojoDetectado = true;
+          if (pixy.ccc.blocks[i].m_x < pixy.frameWidth / 2) {
+            posicionBloqueX = -1;
+          } else {
+            posicionBloqueX = 1;
+          }
+          if (pixy.ccc.blocks[i].m_width * pixy.ccc.blocks[i].m_height > UMBRAL_TAMANO_BLOQUE_ROJO) {
+            bloqueRojoCercano = true;
+          }
+          break;
+        }
+      }
+    }
+  }
+}
+
+void avanzar() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  ledcWrite(MOTOR_PWM_CHANNEL, velocidadNormal);
+}
+
+void retroceder() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  ledcWrite(MOTOR_PWM_CHANNEL, velocidadReversa);
+}
+
+void detenerRobot() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  ledcWrite(MOTOR_PWM_CHANNEL, 0);
+}
